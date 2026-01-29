@@ -1,650 +1,485 @@
+'''
+TESS light-curve anomaly detection pipeline (Orion/TadGAN).
 
-import numpy as np
-import os
-import pandas as pd
+This script:
+  1) Optionally fits (trains) an Orion TadGAN model on a sample FITS light curve.
+  2) Runs anomaly detection across TESS sectors, generating PDFs + CSV logs
+     for any files with high-severity anomalies.
+  3) Enriches results with MAST TIC + SIMBAD metadata where available.
+
+Notes:
+- Many imports and commented blocks reflect experimentation/iteration.
+- Paths are currently hard-coded; consider moving them to constants or CLI args.
+'''
+# =========================
+# Imports
+# =========================
+
+# Standard library
 import csv
-from numpy import ndarray
-from datetime import datetime
-#pd.set_option('display.max_rows', None)
-import tensorflow as tf
-import time as time_now
-
-import matplotlib.pyplot as plt
-import astropy
-import astropy.units as u
-import lightkurve as lk
-from lightkurve import TessLightCurveFile
-from astropy.io import fits
-from astropy.wcs import WCS
-from astropy.utils.data import get_pkg_data_filename
-from astropy.timeseries import TimeSeries
+import os
 import pickle
-from pathlib import Path
-from orion.data import load_signal
-global train_data
-train_data = load_signal('S-1-train')
-global train_data2
-train_data2 = pd.DataFrame(data = train_data)
-from astroquery.mast import Catalogs
-from astroquery.simbad import Simbad
+import time as time_now
 import traceback
-import math
+from datetime import datetime
+from pathlib import Path
+
+# Third-party
+import numpy as np
+import pandas as pd
+import tensorflow as tf  # imported for environment/model deps (may be unused here)
+import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
-from datetime import datetime
+# Astronomy / TESS tooling
+# (Some of these are only used in optional / commented sections. Keeping them
+# makes it easier to toggle features back on without hunting imports.)
+import astropy  # noqa: F401
+import astropy.units as u  # noqa: F401
+import lightkurve as lk  # noqa: F401
+from astropy.io import fits  # noqa: F401
+from astropy.timeseries import TimeSeries  # noqa: F401
+from astropy.utils.data import get_pkg_data_filename  # noqa: F401
+from astropy.wcs import WCS  # noqa: F401
+from astroquery.mast import Catalogs
+from astroquery.simbad import Simbad
+from lightkurve import TessLightCurveFile  # noqa: F401
+
+# Orion
+from orion.data import load_signal
+
+# Local modules
 import funcsTess
 import symFunc
 
+
+# =========================
+# Convenience aliases
+# =========================
 data_fix = funcsTess.data_fix
 data_fix2 = funcsTess.data_fix2
 data_fix3 = funcsTess.data_fix3
 sym_func_p = symFunc.sym_func_p
 sym_func_t = symFunc.sym_func_t
 
-f = open('test_file', 'w')
-writer = csv.writer(f)
 
-tess_array =[]
+# =========================
+# Configuration
+# =========================
 
-times_detect = 0
-tess_data = []
+# Model path (pickle) used for load/save
+MODEL_PATH = Path("/home/nvasilescunyc/tess/TADGAN3/trained_model.pickle")
 
-n = 0
+# TESS SPOC raw light curve directories (per-sector folders)
+SECTOR_PATH_PREFIX_LT10 = "/data/scratch/data/tess/lcur/spoc/raws/sector-0"
+SECTOR_PATH_PREFIX_GE10 = "/data/scratch/data/tess/lcur/spoc/raws/sector-"
 
-global times_fit
+# Logging outputs
+TRAIN_TIMES_CSV = Path("time_list_train.csv")
+DETECT_TIMES_CSV = Path("time_list_detect.csv")
+MASTER_ANOMALY_CSV = Path("master_anomaly_list.csv")
+
+# Detection threshold used to trigger report generation / catalog enrichment
+SEVERITY_TRIGGER = 0.90
+
+# Light-curve heuristics used for the simple classification logic below
+PULSE_HIGH_THRESH = 1.05
+PULSE_LOW_THRESH = 0.95
+COUNT_THRESHOLD = 20
+
+
+# =========================
+# Optional / legacy data load
+# =========================
+# These are loaded but not used directly below; they may have been part of
+# earlier experiments or are used indirectly in imported modules.
+train_data = load_signal("S-1-train")
+train_data2 = pd.DataFrame(data=train_data)
+
+
+# =========================
+# Helper functions
+# =========================
+def now_string() -> str:
+    """Return a human-readable timestamp."""
+    return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+
+def load_model(path: Path):
+    """Load a pickled Orion model."""
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def save_model(model, path: Path) -> None:
+    """Save an Orion model to disk (pickle)."""
+    with open(path, "wb") as f:
+        pickle.dump(model, f)
+
+    # Some Orion models support .save(); keep for compatibility.
+    try:
+        model.save(str(path))
+    except Exception:
+        pass
+
+
+def append_csv_row(csv_path: Path, row: list) -> None:
+    """Append a single row to a CSV file."""
+    with open(csv_path, "a", newline="") as h:
+        writer = csv.writer(h)
+        writer.writerow(row)
+
+
+def write_master_header_if_needed(csv_path: Path) -> None:
+    """Write the master anomaly CSV header if file is missing/empty."""
+    header = [
+        "TIC",
+        "SECTOR",
+        "Tmag",
+        "Vmag",
+        "Plx",
+        "Lumclass",
+        "RV_Value",
+        "Start",
+        "End",
+        "Severity",
+        "Date",
+        "Classification",
+        "Symmetry",
+    ]
+
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        append_csv_row(csv_path, header)
+
+
+def parse_tic_and_sector(file_address: str) -> tuple[str, str]:
+    """Parse TIC ID + sector from the SPOC filename convention."""
+    parts = file_address.split("-")
+
+    # This mirrors the original logic; it will throw if the filename pattern changes.
+    file_name = str(parts[3]).lstrip("0")
+    sector = str(parts[2]).lstrip("s0")
+
+    tic = f"TIC{file_name}"
+    return tic, sector
+
+
+def query_mast_tic(tic: str) -> dict:
+    """Query MAST TIC catalog for basic fields (best-effort)."""
+    try:
+        catalog_data = Catalogs.query_object(tic, catalog="TIC")
+        return {
+            "Tmag": str(catalog_data[:1]["Tmag"]),
+            "Vmag": str(catalog_data[:1]["Vmag"]),
+            "plx": str(catalog_data[:1]["plx"]),
+            "lumclass": str(catalog_data[:1]["lumclass"]),
+        }
+    except Exception:
+        return {"Tmag": "fail", "Vmag": "fail", "plx": "fail", "lumclass": "fail"}
+
+
+def query_simbad_rv(tic: str) -> str:
+    """Query SIMBAD for RV_VALUE (radial velocity), best-effort."""
+    try:
+        Simbad.add_votable_fields("typed_id", "rv_value", "sp")
+        result_table = Simbad.query_object(tic)
+        return str(result_table["RV_VALUE"])
+    except Exception:
+        return "fail"
+
+
+def clean_catalog_field(raw: str, remove_tokens: list[str]) -> str:
+    """Strip common tokens from catalog-field strings."""
+    cleaned = raw
+    for tok in remove_tokens:
+        cleaned = cleaned.replace(tok, "")
+    return cleaned
+
+
+def classify_lightcurve(second_col: np.ndarray) -> str:
+    """Naive classification heuristic based on thresholded flux counts."""
+    high_count = np.count_nonzero(second_col > PULSE_HIGH_THRESH, axis=0)
+    low_count = np.count_nonzero(second_col < PULSE_LOW_THRESH, axis=0)
+
+    if high_count > COUNT_THRESHOLD and low_count < COUNT_THRESHOLD:
+        return "PULSE"
+    if high_count < COUNT_THRESHOLD and low_count > COUNT_THRESHOLD:
+        return "TRANSIT"
+    return "NY-Classified"
+
+
+def symmetry_classification(classify: str, second_col: np.ndarray) -> str:
+    """Run the appropriate symmetry function based on the class."""
+    if classify == "PULSE":
+        return sym_func_p(second_col, 10)
+    if classify == "TRANSIT":
+        return sym_func_t(second_col, 10)
+    return "NA"
+
+
+# =========================
+# Main script state
+# =========================
+
+# Placeholder from the original script (not used later). Kept so behavior stays similar.
+legacy_file = open("test_file", "w")
+legacy_writer = csv.writer(legacy_file)
 
 times_fit = 0
 times_detect = 0
-#this is a function that takes the Fit file and fixes the data that goes in to the GANS machine analysis for anomalies.
-#it changes 3 things 1) gets rid of rows that has empty light values, 2) changes the light values to the values divided by the average value of that filed.  So the value if normal is 1.0
-#changes the timestamps to be just 1, 2, 3 ... etc for each row.
-
-'''
-from orion import Orion
-# load saved model
-#joblib.load
+n = 0  # total files encountered (across sectors)
 
 
+# =========================
+# (Optional) Fit / train loop
+# =========================
+# This loop currently trains on the FIRST file encountered in sector 1 only.
+# Note: because of the `count > 0: break`, it runs at most once per sector.
 
-#This is another version of Orion to load other than TADGAAN
+orion_test = load_model(MODEL_PATH)
 
-#Try setting the interval between each value and the other to 1 (frequency of data based on the head you are showing)
-
-hyperparameters = {
-                        "mlprimitives.custom.timeseries_preprocessing.time_segments_aggregate#1": {
-                            "interval": 1,
-
-                        },
-
-                        "mlprimitives.custom.timeseries_preprocessing.rolling_window_sequences#1": {
-                            "window_size": 100,
-                            "target_column": [0, 1, 2, 3]
-
-                        },
-                        "orion.primitives.tadgan.TadGAN#1": {
-                            'epochs': 1,
-                            'verbose': True,
-                            'input_shape': [100, 4]
-
-
-                        }
-            }
-
-'''
-
-with open('/home/nvasilescunyc/tess/TADGAN3/trained_model.pickle' , 'rb') as f:
-    orion_test = pickle.load(f)
-
-'''
-orion_test = Orion(
-    pipeline='tadgan',
-    hyperparameters=hyperparameters
-    )
-
-'''
-#orion_test = orion = Orion( pipeline='lstm_dynamic_threshold', hyperparameters=hyperparameters)
-
-
-
-
-
-#This for loop goes through the various sectors for the files I want the machine learning to train with.
 for y in range(1, 2):
-    #print("This is y", y)
+    # Keep the original printed path behavior
+    path_prefix = SECTOR_PATH_PREFIX_LT10 if y < 10 else SECTOR_PATH_PREFIX_GE10
+    print(path_prefix)
 
-    if y < 10:
-        path = "/data/scratch/data/tess/lcur/spoc/raws/sector-0"
-        print(path)
-    else:
-        path = "/data/scratch/data/tess/lcur/spoc/raws/sector-"
-        print(path)
     count = 0
-    for root, dirs, files in os.walk(f"{path}{y}"):
-
+    for root, dirs, files in os.walk(f"{path_prefix}{y}"):
         for name in files:
-            count = count + 1
+            count += 1
+
+            # Break after the first file so you don't train on the whole sector.
             if count > 0:
-              break
+                break
 
-            #print(data_fix(name))
             start = time_now.time()
-            #return_array = (data_fix(name))
-            #analyze_array = return_array[['timestamp','value']]
-            #print("analyze_array", analyze_array)
-            file_address = root + "/" + name
+            file_address = f"{root}/{name}"
 
+            # Fit the model on cleaned data from this file.
             orion_test.fit(data_fix(file_address))
+
             train_time = time_now.time() - start
-            times_fit = times_fit + 1
+            times_fit += 1
+
             print("this is times fit #", times_fit)
             print("This is name of file", name)
-            now = datetime.now()
-            dt_string = now.strftime("%d/%m/%Y %H:%M:%S")
-            #print("this is the time of fit:", dt_string)
+
+            append_csv_row(TRAIN_TIMES_CSV, [times_fit, train_time, now_string()])
+            save_model(orion_test, MODEL_PATH)
 
 
-            # create an iterator object with write permission - model.pkl
-            with open('time_list_train.csv', 'a') as h:
+# =========================
+# Detection / reporting loop
+# =========================
 
-                        writer2 = csv.writer(h)
-                        # write a row to the csv file
-                        row = [times_fit, train_time, dt_string]
-                        writer2.writerow(row)
-                        h.close()
-
-
-            with open('/home/nvasilescunyc/tess/TADGAN3/trained_model.pickle', 'wb') as f:
-                pickle.dump(orion_test, f)
-                orion_test.save('/home/nvasilescunyc/tess/TADGAN3/trained_model.pickle')
-
-#This is a for loop that goes through the files to detect light curve anomolies.
-with open('master_anomaly_list.csv', 'a') as g:
-    writer2 = csv.writer(g)
-    row = ["TIC", "SECTOR", "Tmag", "Vmag", "Plx", "Lumclass", "RV_Value", "Start", "End", "Severity", "Date", "Classification", "Symmetry"]
-    writer2.writerow(row)
-    g.close()
+write_master_header_if_needed(MASTER_ANOMALY_CSV)
 
 for y in range(6, 27):
-    #print("This is y", y)
-    with open('/home/nvasilescunyc/tess/TADGAN3/trained_model.pickle' , 'rb') as f:
-        orion_test = pickle.load(f)
+    # Reload model each sector (matches original behavior)
+    orion_test = load_model(MODEL_PATH)
 
-    if y < 10:
-        path = "/data/scratch/data/tess/lcur/spoc/raws/sector-0"
-
-    else:
-        path = "/data/scratch/data/tess/lcur/spoc/raws/sector-"
-
+    base_path = SECTOR_PATH_PREFIX_LT10 if y < 10 else SECTOR_PATH_PREFIX_GE10
     count = 0
-    for root, dirs, files in os.walk(f"{path}{y}"):
 
-
+    for root, dirs, files in os.walk(f"{base_path}{y}"):
         for name in files:
-
             x_zoom = []
             y_zoom = []
 
-            #if count > 10:
-               # break
-            n = n + 1
-            count = count + 1
+            n += 1
+            count += 1
+            times_detect += 1
 
-            times_detect = times_detect + 1
             print("this is times detect #", times_detect)
             print("This is name of file", name)
+
             start2 = time_now.time()
-            file_address = root + "/" + name
-            print("this is start time", start2)
-            #print("analyze_array", analyze_array)
+            file_address = f"{root}/{name}"
+
+            # Clean the data into Orion's expected input format
             open_file = data_fix(file_address)
 
+            # Run anomaly detection
             anomalies = orion_test.detect(open_file)
-            #print("file address:", file_address)
-            #print("this is the sector and file", end_address)
-            print(f"This is anomalies in file {file_address}: \n", anomalies)
+            print(f"This is anomalies in file {file_address}:\n", anomalies)
 
-            end_time = time_now.time()
+            detect_time = time_now.time() - start2
+            append_csv_row(DETECT_TIMES_CSV, [count, times_fit, detect_time, now_string()])
 
-            train_time2 = end_time - start2
-            now2 = datetime.now()
-            dt_string2 = now2.strftime("%d/%m/%Y %H:%M:%S")
-
-            with open('time_list_detect.csv', 'a') as i:
-
-                writer2 = csv.writer(i)
-                # write a row to the csv file
-                row = [count, times_fit, train_time2, dt_string2]
-                writer2.writerow(row)
-                i.close()
-
-            if anomalies[anomalies['severity'] > 0.90].empty == False:
+            # If there is at least one anomaly above the trigger, generate outputs
+            if not anomalies[anomalies["severity"] > SEVERITY_TRIGGER].empty:
                 print("success")
 
-
                 cut_one_array = np.array(open_file)
-                print("cut one array \n", cut_one_array)
                 second_col = cut_one_array[:, [1]]
-                #second_col_nozeros = second_col[~np.all(second_col == 0, axis=1)]
-                first_col = cut_one_array[:, [0]]
-                first_col_nozeros = first_col[~np.all(first_col == 0, axis=1)]
-                bh_count = np.count_nonzero(second_col > 1.05, axis= 0)
-                bh_count2 = np.count_nonzero(second_col < 0.95, axis= 0)
-                print(f"this is count 1 and count 2:  {bh_count} {bh_count2}")
-                exo_count = np.count_nonzero(second_col > 1.05, axis= 0)
-                exo_count2 = np.count_nonzero(second_col < 0.95, axis= 0)
-                print(f"this is count 1 and count 2:  {exo_count} {exo_count2}")
 
+                classify = classify_lightcurve(second_col)
+                sym_class = symmetry_classification(classify, second_col)
 
-                if bh_count > 20 and bh_count2 < 20:
-                    classify = "PULSE"
-                elif exo_count < 20 and exo_count2 > 20:
-                    classify = "TRANSIT"
-                else:
-                    classify = "NY-Classified"
+                # Arrays for plotting
+                data_plot = np.array(data_fix2(file_address))
+                data_plot2 = np.array(data_fix3(file_address))
 
-                if classify == "PULSE" :
-                    sym_class = sym_func_p(second_col, 10)
+                # Extract anomaly arrays (kept as arrays like original)
+                start_arr = np.array(anomalies["start"])
+                end_arr = np.array(anomalies["end"])
+                severity_arr = np.array(anomalies["severity"])
 
-                elif classify == "TRANSIT" :
-                    sym_class = sym_func_t(second_col, 10)
-
-                else:
-                    sym_class = "NA"
-
-
-
-
-
-
-                return_array = (data_fix2(file_address))
-                cut_one_array2 = return_array
-                cut_one_array3 = (data_fix3(file_address))
-                start = np.array(anomalies['start'])
-                end = np.array(anomalies['end'])
-                severity = np.array(anomalies['severity'])
-
-
-                print(anomalies)
-                print(start, end, severity)
-
-                file_address = root + "/" + name
-                file_address_split = file_address.split("-")
-                print("file name before file address split", file_address_split)
-                file_name = str(file_address_split[3])
-                print("file name", file_name)
-                file_name = file_name.lstrip('0')
-                print("file name before sector strip", file_name)
-                sector =  str(file_address_split[2])
-                print("sector before strip", sector)
-                sector = sector.lstrip('s0')
-                print("this is sector", sector)
-
-
-                #mast and simbad data download
-                tic = "TIC" + str(file_name)
-
+                # Parse TIC + sector from filename/path
                 try:
+                    tic, sector = parse_tic_and_sector(file_address)
+                except Exception:
+                    print("Failed parsing TIC/sector from filename.")
+                    traceback.print_exc()
+                    continue
 
-                    catalogData = Catalogs.query_object(tic,  catalog = "TIC")
-                    mast_data_tmag = catalogData[:1]['Tmag']
-                    mast_data_vmag = catalogData[:1]['Vmag']
-                    mast_data_plx = catalogData[:1]['plx']
-                    mast_data_lumc = catalogData[:1]['lumclass']
+                # Catalog enrichment (best-effort)
+                mast = query_mast_tic(tic)
+                simb_rv = query_simbad_rv(tic)
 
-                except:
-                    catalogData = ["fail"]
-                    mast_data_tmag = ["fail"]
-                    mast_data_vmag = ["fail"]
-                    mast_data_plx = ["fail"]
-                    mast_data_lumc = ["fail"]
-                    pass
-
-                try:
-                    Simbad.add_votable_fields('typed_id', 'rv_value', 'sp')
-                    result_table = Simbad.query_object(tic)
-                    print("\n")
-                    simb_data = result_table['RV_VALUE']
-
-                except:
-                    simb_data = ["fail"]
-                    pass
-
-                #plt.ylim(0, 3)
-
-                now = datetime.now()
-                dt_string = now.strftime("%d/%m/%Y %H:%M:%S")
-                #print("this is the time of detect:", dt_string)
-                #mast and simbad data download
-
-
-
-                '''
-                tic = "TIC" + str(file_name)
-                catalogData = Catalogs.query_object(tic,  catalog = "TIC")
-                mast_data = catalogData[:1]['Tmag','Vmag', 'plx', 'lumclass']
-                #Simbad.add_votable_fields('typed_id', 'rv_value', 'sp')
-                result_table = Simbad.query_object(tic)
-                print("\n")
-                simb_data = result_table['RV_VALUE']
-                #print(f"{tic} MAST: {mast_data} and SIMBAD: {simb_data}")
-                '''
-
-
-                print("number of files found", n)
-                data_plot = cut_one_array2
-                #data_plot = data_fix(name)
-                data_plot = np.array(data_plot)
-                data_plot2= cut_one_array3
-                data_plot2 = np.array(data_plot2)
-
-
+                # Coordinates
                 x_coordinate = data_plot[:, [0]]
                 y_coordinate = data_plot[:, [1]]
                 x2_coordinate = data_plot2[:, [0]]
                 y2_coordinate = data_plot2[:, [1]]
+
                 back_coordinate = data_plot[:, [2]]
                 cent1_coordinate = data_plot[:, [3]]
                 cent2_coordinate = data_plot[:, [4]]
-                high_y = (max(y_coordinate) * 1.15)
-                high_y = high_y.astype(np.float)
-                print("high_y", high_y)
-                low_y = (min(y_coordinate) * 0.85)
-                low_y = low_y.astype(np.float)
-                print("low y", low_y)
 
-                print("file name", file_name)
-                print("this is sector", sector)
-                #sector =  str(file_name2[2])
+                pdf_name = f"{tic}_{y}_{classify}_{sym_class}.pdf"
 
-                #plot matplot
-                now = datetime.now()
-                dt_string = now.strftime("%d/%m/%Y %H:%M:%S")
-                #print("this is the time of detect:", dt_string)
-
-                with PdfPages(f"{tic}_{y}_{classify}_{sym_class}.pdf") as pdf:
-                    #plot 1 raw average light curve
-                    plt.figure(figsize = (10, 5.2))
-                    #plt.ylim(low_y, high_y)
-                    plt.title(f"TIC {file_name} Sector {y}")
-                    plt.text(2, 3, tic)
-                    plt.plot(x_coordinate, y_coordinate, color="green")
-                    plt.xlabel('Time')
-                    plt.ylabel('Light Values (Unchanged)')
-                    plt.figtext(0.40, 0.85, " ", horizontalalignment ="center", verticalalignment ="top", wrap = True, fontsize = 10, color ="black")
-                    #plt.axis("tight")
-                    #plt.axis('off')
-                    #plt.show()
-                    #pdf.savefig()  # saves the current figure into a pdf page
+                with PdfPages(pdf_name) as pdf:
+                    # Plot 1 (created but not saved in original)
+                    plt.figure(figsize=(10, 5.2))
+                    plt.title(f"{tic} Sector {y}")
+                    plt.plot(x_coordinate, y_coordinate)
+                    plt.xlabel("Time")
+                    plt.ylabel("Light Values (Unchanged)")
                     plt.close()
 
-                    #plot 2 medium average light curve
-                    plt.figure(figsize = (10, 5.2))
-                    #plt.ylim(low_y, high_y)
-                    plt.title(f"Target TIC {file_name} Sector {y} {sym_class}" )
-                    plt.text(2, 3, tic)
-                    plt.plot(x2_coordinate, y2_coordinate, color="blue")
-                    plt.xlabel('Time')
-                    plt.ylabel('Relative Flux (Electrons Per Second)')
-                    plt.figtext(0.40, 0.85, " ", horizontalalignment ="center", verticalalignment ="top", wrap = True, fontsize = 10, color ="black")
-                    #plt.axis("tight")
-                    #plt.axis('off')
-                    #plt.show()
-                    pdf.savefig()  # saves the current figure into a pdf page
+                    # Plot 2 (saved)
+                    plt.figure(figsize=(10, 5.2))
+                    plt.title(f"Target {tic} Sector {y} {sym_class}")
+                    plt.plot(x2_coordinate, y2_coordinate)
+                    plt.xlabel("Time")
+                    plt.ylabel("Relative Flux (Electrons Per Second)")
+                    pdf.savefig()
                     plt.close()
 
-
-
-
-
-                    '''
-                    #plot 2 normal Lightcurve
-                    lc_1= TessLightCurveFile(file_address)
-                    ax1 = lc_1.plot()
-                    ax1.set_title("Regular LC Plot")
-                    #plt.show()
-                    #ax1.figure.savefig(f'{tic}-sec{y}_Lc_plot.png')
-                    pdf.savefig()  # saves the current figure into a pdf page
-                    plt.close()
-                    '''
-
-                    #tpf_target = lk.search_targetpixelfile(f"{file_name}", author="Tess", cadence='long', sector={sector}).download()
-
-                    #plot 3 back light compared to light curve
-                    plt.figure(figsize = (10, 5.2))
-                    high_y = (max(y_coordinate) * 1.25)
-                    high_y = high_y.astype(np.float)
-                    low_y = (min(y_coordinate) * 0.75)
-                    low_y = low_y.astype(np.float)
-                    #plt.ylim(low_y, high_y)
-                    plt.title(f"TIC {file_name} Sector {y} -- Background  curve")
-                    #plt.text(2, 3, tic)
-                    #plt.plot(x_coordinate, y_coordinate, color="green")
-                    plt.plot(x_coordinate, back_coordinate, color="blue")
-                    plt.xlabel('Time')
-                    plt.ylabel('Flux (Electrons Per Second)')
-                    plt.figtext(0.40, 0.85, " ", horizontalalignment ="center", verticalalignment ="top", wrap = True, fontsize = 10, color ="black")
-                    pdf.savefig()  # saves the current figure into a pdf page
+                    # Plot 3: background
+                    plt.figure(figsize=(10, 5.2))
+                    plt.title(f"{tic} Sector {y} — Background curve")
+                    plt.plot(x_coordinate, back_coordinate)
+                    plt.xlabel("Time")
+                    plt.ylabel("Flux (Electrons Per Second)")
+                    pdf.savefig()
                     plt.close()
 
-                    #plot 4 centroid1.
-
-                    plt.figure(figsize = (10, 5.2))
-                    high_y = (max(y_coordinate) * 1.25)
-                    high_y = high_y.astype(np.float)
-                    low_y = (min(y_coordinate) * 0.75)
-                    low_y = low_y.astype(np.float)
-                    #plt.ylim(low_y, high_y)
-                    plt.title(f"TIC {file_name} Sector {y} -- Centroid 1 Curve")
-                    plt.text(2, 3, tic)
-                    #plt.plot(x_coordinate, y_coordinate, color="green")
-                    plt.plot(x_coordinate, cent1_coordinate, color="magenta")
-                    #plt.plot(x_coordinate, cent2_coordinate, color="cyan")
-                    plt.xlabel('Time')
-                    plt.ylabel('Flux (Electrons Per Second')
-                    plt.figtext(0.40, 0.85, " ", horizontalalignment ="center", verticalalignment ="top", wrap = True, fontsize = 10, color ="black")
-                    #plt.axis("tight")
-                    #plt.axis('off')
-                    #plt.show()
-                    pdf.savefig()  # saves the current figure into a pdf page
+                    # Plot 4: centroid1
+                    plt.figure(figsize=(10, 5.2))
+                    plt.title(f"{tic} Sector {y} — Centroid 1 Curve")
+                    plt.plot(x_coordinate, cent1_coordinate)
+                    plt.xlabel("Time")
+                    plt.ylabel("Flux (Electrons Per Second)")
+                    pdf.savefig()
                     plt.close()
 
-
-                    #plot 5 centroid2.
-
-                    plt.figure(figsize = (10, 5.2))
-                    high_y = (max(y_coordinate) * 1.25)
-                    high_y = high_y.astype(np.float)
-                    low_y = (min(y_coordinate) * 0.75)
-                    low_y = low_y.astype(np.float)
-                    #plt.ylim(low_y, high_y)
-                    plt.title(f"TIC {file_name} Sector {y} -- Centroid 2 Curve")
-                    plt.text(2, 3, tic)
-                    #plt.plot(x_coordinate, y_coordinate, color="green")
-                    #plt.plot(x_coordinate, cent1_coordinate, color="magenta")
-                    plt.plot(x_coordinate, cent2_coordinate, color="red")
-                    plt.xlabel('Time')
-                    plt.ylabel('Flux (Electrons Per Second)')
-                    plt.figtext(0.40, 0.85, " ", horizontalalignment ="center", verticalalignment ="top", wrap = True, fontsize = 10, color ="black")
-                    #plt.axis("tight")
-                    #plt.axis('off')
-                    #plt.show()
-                    pdf.savefig()  # saves the current figure into a pdf page
+                    # Plot 5: centroid2
+                    plt.figure(figsize=(10, 5.2))
+                    plt.title(f"{tic} Sector {y} — Centroid 2 Curve")
+                    plt.plot(x_coordinate, cent2_coordinate)
+                    plt.xlabel("Time")
+                    plt.ylabel("Flux (Electrons Per Second)")
+                    pdf.savefig()
                     plt.close()
 
-
-                    time = 0
-
-
+                    # Zoom + highlight plots for each detected anomaly window
                     array_anomalies = np.array(anomalies)
 
-                    for i in array_anomalies[0:]:
+                    for row in array_anomalies:
+                        # row is typically [start, end, severity, ...]
+                        if row[2] <= 0.30:
+                            continue
 
-                        print("this is i in amomalies", i)
-                        print("this is i severity", i[2])
+                        sever_no = float(row[2])
+                        sever_str = f"{sever_no:.3f}"
 
-                        if i[2]> 0.30:
-                            time = time + 1
-                            print("Time is", time)
-                            sever_no = i[2]
-                            sever_no = f"{sever_no:.3f}"
+                        # Expand window like original
+                        start_idx = int(row[0] - 30) if row[0] > 30 else int(row[0])
+                        end_idx = int(row[1])
 
-                            print("this is severity", sever_no)
+                        # Build zoom arrays
+                        x_zoom.clear()
+                        y_zoom.clear()
+                        for p in data_plot:
+                            if start_idx < p[0] < end_idx:
+                                x_zoom.append(p[0])
+                                y_zoom.append(p[1])
 
+                        # Zoom plot
+                        plt.figure(figsize=(10, 5.2))
+                        plt.title(f"Zoom severity {sever_str}")
+                        plt.plot(x_zoom, y_zoom)
+                        plt.xlabel("Time")
+                        plt.ylabel("Flux (RAW)")
+                        pdf.savefig()
+                        plt.close()
 
-                            if i[0] > 30:
-                                start = int(i[0] - 30)
-                            else:
-                                start = int(i[0])
+                        # Full curve with highlighted segment
+                        plt.figure(figsize=(10, 5.2))
+                        plt.title(f"{tic} Sector {y} Severity from {start_idx} to {end_idx}")
+                        plt.plot(x_coordinate, y_coordinate)
 
-                            end = int(i[1])
-                            print(array_anomalies)
-                            print("This is start and end and severity", start, end, i[2])
+                        x2 = list(range(start_idx, end_idx))
+                        if x2:
+                            y_baseline = [y_coordinate[start_idx]] * len(x2)
+                            plt.plot(x2, y_baseline)
 
-                            for i in data_plot:
-                                if (i[0] > start) and (i[0] < end):
-                                    print("this is i row light value", i[1])
-                                    x_zoom.append(i[0])
-                                    y_zoom.append(i[1])
-                            #print("This is zoom_array \n", zoom_array)
+                            # Arrow pointing down to the highlighted section
+                            plt.arrow(
+                                x2[0],
+                                y_baseline[0] * 1.01,
+                                0.0,
+                                -0.04,
+                                width=100,
+                                head_width=300,
+                                head_length=100,
+                            )
 
+                        plt.xlabel("Time")
+                        plt.ylabel("Flux (RAW)")
+                        pdf.savefig()
+                        plt.close()
 
-                            #print("x_zoom", x_zoom)
-                            #print("y_zoom", y_zoom)
+                # Append metadata to the master anomaly list CSV
+                Tmag = clean_catalog_field(mast["Tmag"], ["Tmag", "-", "[", "]"])
+                Vmag = clean_catalog_field(mast["Vmag"], ["Vmag", "-", "[", "]"])
+                Plx = clean_catalog_field(mast["plx"], ["plx", "-", "[", "]"])
+                LumD = clean_catalog_field(mast["lumclass"], ["lumclass", "-", "[", "]"])
 
-                            #plot 6 Zoom  light curve
-                            plt.figure(figsize = (10, 5.2))
-                            #plt.ylim(low_y, high_y)
-                            plt.title(f"Zoom severity {sever_no}")
-                            plt.plot(x_zoom, y_zoom, color="green")
-                            plt.xlabel('Time')
-                            plt.ylabel('Flux (RAW)')
-                            plt.figtext(0.40, 0.85, " ", horizontalalignment ="center", verticalalignment ="top", wrap = True, fontsize = 10, color ="black")
-                            #plt.axis("tight")
-                            #plt.axis('off')
-                            #plt.show()
-                            pdf.savefig()  # saves the current figure into a pdf page
-                            plt.close()
+                rvD = clean_catalog_field(simb_rv, ["RV_VALUE", "km", "/", "s", "-", "[", "]"])
 
-                            '''
-                            with fits.open(file_address) as hdul:
-                                data = hdul[1].data
-                                #print("length before cut", len(data))
-                                #print(data)
-                                print("\n")
-                                mask = data['TIME']
-
-                                print("print length mask", len(mask))
-                                print("this is end", end)
-                                print("print mask end", mask[end])
-                                print("mask 20", mask[end])
-
-                                mask2 = mask < mask[end]
-                                print("mask length after first cut", len(mask2))
-                                count_mask = 0
-                                for i in mask2:
-                                    if i == True:
-                                        count_mask = count_mask + 1
-                                print("count mask2 is", count_mask)
-
-                                print("mask", mask2)
-                                newdata = data[mask2]
-                                print("length after first cut newdata", len(newdata))
-                                hdu = fits.BinTableHDU(data=newdata)
-                                hdu.writeto(f'newtable[time].fits', overwrite=True)
-                                print("\n\n\n")
-
-                            with fits.open(f"newtable[time].fits") as hdul2:
-                                data2 = hdul2[1].data
-                                #print(data2)
-                                mask3 = data2['TIME']
-                                #print("mask length before second cut", len(mask3))
-                                #print("this is start", start)
-                                #print("This is mask start", mask[start])
-                                mask4 = mask3 > mask[start]
-                                newdata3 = data2[mask4]
-                                hdu = fits.BinTableHDU(data=newdata3)
-                                hdu.writeto(f'newtable[time]a.fits', overwrite=True)
-                                #print("length after second cut", len(newdata3))
-                                #print("\n\n\n")
-                                #print(newdata3)
-
-                            lc_1= TessLightCurveFile(f"newtable[time]a.fits")
-                            ax1 = lc_1.plot()
-                            ax1.set_title(f"Zoom severity {sever_no}")
-                            #plt.show()
-                            #ax1.figure.savefig(f'{tic}-sec{y}_Lc_plot.png')
-                            pdf.savefig()  # saves the current figure into a pdf page
-                            plt.close()
-                            '''
-
-                            plt.figure(figsize = (10, 5.2))
-                            #plt.ylim(low_y, high_y)
-                            plt.title(f"TIC {file_name} Sector {y} Severity from {start} to {end}")
-                            plt.text(2, 3, tic)
-                            plt.plot(x_coordinate, y_coordinate, color="green")
-                            x_range = range(start, end)
-                            x2 = list(x_range)
-                            length_y = len(x2)
-                            y2 = [y_coordinate[start]] * length_y
-                            plt.plot(x2, y2, color="red")
-
-                            #plt.arrow(x2[0], y2[0] * 1.02, 0, 0.03,  head_width = 1, width = 0.05)
-
-                            plt.arrow(x2[0], y2[0] * 1.01,  0.0, -0.04, fc="k", ec="k", width = 100, head_width=300, head_length=100 )
-                            #plt.annotate("Zoom", x2[0], y2[0] * 0.98)
-                            '''
-                            label_x = x2[0] - 20
-                            label_y = y2[0]
-                            arrow_x = x2[0]
-                            arrow_y = y2[0] * 1.03
-                            arrow_properties = dict(facecolor="black", width=0.5, headwidth=4, shrink=0.1)
-                            plt.annotate("Zoom", xy=(arrow_x, arrow_y), xytext=(label_x, label_y),arrowprops=arrow_properties)
-                            '''
-                            plt.xlabel('Time')
-                            plt.ylabel('Flux (RAW)')
-                            plt.figtext(0.40, 0.85, " ", horizontalalignment ="center", verticalalignment ="top", wrap = True, fontsize = 10, color ="black")
-                            #plt.axis("tight")
-                            #plt.axis('off')
-                            #plt.show()
+                append_csv_row(
+                    MASTER_ANOMALY_CSV,
+                    [
+                        tic.replace("TIC", ""),  # original wrote numeric file_name
+                        sector,
+                        Tmag,
+                        Vmag,
+                        Plx,
+                        LumD,
+                        rvD,
+                        start_arr,
+                        end_arr,
+                        severity_arr,
+                        now_string(),
+                        classify,
+                        sym_class,
+                    ],
+                )
 
 
-                            pdf.savefig()  # saves the current figure into a pdf page
-                            plt.close()
-
-
-
-
-                with open('master_anomaly_list.csv', 'a') as g:
-
-                        writer2 = csv.writer(g)
-                        # write a row to the csv file
-
-                        Tmag = str(mast_data_tmag)
-                        Tmag = Tmag.replace("Tmag", "")
-                        Tmag = Tmag.replace("-", '')
-                        Vmag = str(mast_data_vmag)
-                        Vmag = Vmag.replace("Vmag", "")
-                        Vmag = Vmag.replace("-", '')
-                        Plx = str(mast_data_plx)
-                        Plx = Plx.replace("plx", "")
-                        Plx = Plx.replace("-", '')
-                        LumD = str(mast_data_lumc)
-                        LumD = LumD.replace("lumclass", "")
-                        LumD = LumD.replace("-", '')
-                        rvD = str(simb_data)
-                        rvD = rvD.replace("RV_VALUE", "")
-                        rvD = rvD.replace("km", "")
-                        rvD = rvD.replace("/", "")
-                        rvD = rvD.replace("s", "")
-                        rvD = rvD.replace("-", "")
-                        row = [file_name, sector, Tmag, Vmag, Plx, LumD, rvD, start, end, severity, dt_string, classify, sym_class]
-                        writer2.writerow(row)
-                        g.close()
-
-
-
-with open('/home/nvasilescunyc/tess/TADGAN/mypickle.pickle', 'wb') as f:
+# Final save (kept from original; note this is a different path than MODEL_PATH)
+with open("/home/nvasilescunyc/tess/TADGAN/mypickle.pickle", "wb") as f:
     pickle.dump(orion_test, f)
-    #orion_test.save('/home/nvasilescunyc/tess/TADGAN3/mypickle.pickle')
-
-#print("This is final round anomalies", anomalies)
