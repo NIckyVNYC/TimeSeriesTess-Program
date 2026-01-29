@@ -1,0 +1,19 @@
+name: tess-tadgan
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pandas
+  - matplotlib
+  - scipy
+  - tqdm
+  - astropy
+  - lightkurve
+  - astroquery
+  # TensorFlow can be installed via conda-forge, but many users prefer pip wheels.
+  # If you have a GPU/CUDA environment, you may need a specific TF build.
+  - pip:
+      - tensorflow
+      - orion-ml

@@ -1,0 +1,19 @@
+# Core scientific stack
+numpy
+pandas
+matplotlib
+
+# ML / model runtime (version may need to match your GPU/CPU + CUDA stack)
+tensorflow
+
+# Anomaly detection / Orion
+orion-ml
+
+# Astronomy / TESS tooling
+astropy
+lightkurve
+astroquery
+
+# Optional but commonly useful
+scipy
+tqdm
